@@ -54,6 +54,9 @@ _TrackCurvature = NV.create_from_field_names(
     "TrackCurvature", ("psi_cl_rad", "theta_cl_rad", "phi_cl_rad", "k_psi_cl_radpm", "k_theta_cl_radpm", "k_phi_cl_radpm")
 )
 
+_StatesPast = NV.create_from_field_names(
+    "StatesPast", ("r_2", "r_1", "uy_2", "uy_1", "ux_2", "ux_1", "delta_2", "delta_1", "fx_2", "fx_1")
+)
 
 @cb.casadi_dataclass
 class Model:
@@ -126,8 +129,8 @@ class Model:
 
         return fzf_kn, fzr_kn
 
-    @cb.casadi_method((_StatesDynamics.num_fields, _Inputs.num_fields, _TrackCurvature.num_fields))
-    def temporal_dynamics_dynamics(self, states_vec, inputs_vec, track_curvature_vec):
+    @cb.casadi_method((_StatesDynamics.num_fields, _Inputs.num_fields, _TrackCurvature.num_fields, _StatesPast.num_fields))
+    def temporal_dynamics_dynamics(self, states_vec, inputs_vec, track_curvature_vec, past_vec):
         """
         Calculate temporal velocity state derivatives.
         """
@@ -135,6 +138,7 @@ class Model:
         states = _StatesDynamics.from_array(states_vec)
         inputs = _Inputs.from_array(inputs_vec)
         track_curvature = _TrackCurvature.from_array(track_curvature_vec)
+        past = _StatesPast.from_array(past_vec)
 
         alpha_f_rad, alpha_r_rad = self.slip_angles(
             states.ux_mps,
@@ -209,7 +213,7 @@ class Model:
         fd_n = frr_n + faero_n # Convention: negative Fd is along -x.
 
         # Evaluate state derivatives with neural network
-        input1 = ca.vertcat(states.r_radps, states.uy_mps, states.ux_mps/30, inputs.delta_rad, inputs.fx_kn/8, daz)
+        input1 = ca.vertcat(past.r_2, past.r_1, states.r_radps, past.uy_2/5, past.uy_1/5, states.uy_mps/5, past.ux_2/20, past.ux_1/20, states.ux_mps/20, past.delta_2, past.delta_1, inputs.delta_rad, past.fx_2/6, past.fx_1/6, inputs.fx_kn/6)
         output1 = self.w1 @ input1 + self.b1
         output2 = self.w2 @ ((ca.exp(output1) - ca.exp(output1 * -1)) / (ca.exp(output1) + ca.exp(output1 * -1))) + self.b2
         output3 = self.w3 @ ((ca.exp(output2) - ca.exp(output2 * -1)) / (ca.exp(output2) + ca.exp(output2 * -1))) + self.b3
@@ -257,8 +261,8 @@ class Model:
 
         return dstates_out.to_array()
 
-    @cb.casadi_method((_StatesGlobal.num_fields, _Inputs.num_fields, _TrackCurvature.num_fields))
-    def temporal_global_dynamics(self, states_vec, inputs_vec, track_curvature_vec):
+    @cb.casadi_method((_StatesGlobal.num_fields, _Inputs.num_fields, _TrackCurvature.num_fields, _StatesPast.num_fields))
+    def temporal_global_dynamics(self, states_vec, inputs_vec, track_curvature_vec, past_vec):
         """
         Calculate temporal global dynamic state derivatives.
         """
@@ -274,7 +278,7 @@ class Model:
         )
 
         ddyn_states_vec = self.temporal_dynamics_dynamics(
-            dyn_states.to_array(), inputs_vec, track_curvature_vec,
+            dyn_states.to_array(), inputs_vec, track_curvature_vec, past_vec,
         )
         ddyn_states = _StatesDynamics.from_array(ddyn_states_vec)
 
@@ -295,8 +299,8 @@ class Model:
 
         return dstates_out.to_array()
 
-    @cb.casadi_method((_StatesPath.num_fields, _Inputs.num_fields, _TrackCurvature.num_fields))
-    def temporal_path_dynamics(self, states_vec, inputs_vec, track_curvature_vec):
+    @cb.casadi_method((_StatesPath.num_fields, _Inputs.num_fields, _TrackCurvature.num_fields, _StatesPast.num_fields))
+    def temporal_path_dynamics(self, states_vec, inputs_vec, track_curvature_vec, past_vec):
         """
         Calculate temporal path dynamic state derivatives.
         """
@@ -313,7 +317,7 @@ class Model:
         )
 
         ddyn_states_vec = self.temporal_dynamics_dynamics(
-            dyn_states.to_array(), inputs_vec, track_curvature_vec,
+            dyn_states.to_array(), inputs_vec, track_curvature_vec, past_vec,
         )
         ddyn_states = _StatesDynamics.from_array(ddyn_states_vec)
 
