@@ -44,31 +44,40 @@ def _cast_array_list_to_floats(*arrays: np.ndarray) -> tuple[np.ndarray, ...]:
 
 
 def _project_veh_on_path(
-    rel_east: np.ndarray, rel_north: np.ndarray, path_psi: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    path_tangent = np.row_stack((-np.sin(path_psi), np.cos(path_psi)))
-    path_normal = np.array([[0, -1], [1, 0]]) @ path_tangent
+    rel_east: np.ndarray, rel_north: np.ndarray, rel_up: np.ndarray, path_psi: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    
+    path_tangent = np.row_stack((-np.sin(path_psi), np.cos(path_psi), np.zeros_like(path_psi)))
+    path_normal = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]) @ path_tangent
+    path_binormal = np.row_stack((0, 0, 1)) # TODO
 
-    del_pos = np.column_stack((rel_east, rel_north))
+    del_pos = np.column_stack((rel_east, rel_north, rel_up))
     dot_s = np.diag(del_pos @ path_tangent)
     dot_e = np.diag(del_pos @ path_normal)
+    dot_b = np.diag(del_pos @ path_binormal)
 
     proj_s = dot_s / np.linalg.norm(path_tangent, axis=0, keepdims=True)
     proj_e = dot_e / np.linalg.norm(path_normal, axis=0, keepdims=True)
+    proj_b = dot_b / np.linalg.norm(path_binormal, axis=0, keepdims=True)
 
-    return proj_s.squeeze(), proj_e.squeeze()
+    return proj_s.squeeze(), proj_e.squeeze(), proj_b.squeeze()
 
 
 @dataclass(eq=False)
 class SimpleWorld:
     s_m: np.ndarray
     
-    east_m: np.ndarray
-    north_m: np.ndarray
-    up_m: np.ndarray
+    east_cl_m: np.ndarray
+    north_cl_m: np.ndarray
+    up_cl_m: np.ndarray
 
-    psi_rad: np.ndarray
-    k_1pm: np.ndarray
+    psi_cl_rad: np.ndarray
+    theta_cl_rad: np.ndarray
+    phi_cl_rad: np.ndarray
+    
+    k_psi_cl_radpm: np.ndarray
+    k_theta_cl_radpm: np.ndarray
+    k_phi_cl_radpm: np.ndarray
 
     inner_bound_east_m: np.ndarray
     inner_bound_north_m: np.ndarray
@@ -78,8 +87,9 @@ class SimpleWorld:
     outer_bound_north_m: np.ndarray
     outer_bound_up_m: np.ndarray
 
-    ux_des_mps: np.ndarray
-    e_des_m: np.ndarray
+    ux_ref_mps: np.ndarray
+    e_ref_m: np.ndarray
+    dpsi_ref_rad: np.ndarray
 
     track_width_m: np.ndarray
 
@@ -105,106 +115,125 @@ class SimpleWorld:
         wdict = {key: val[-1:] for key, val in self.asdict().items()}
         return type(self)(**wdict)
 
-    def enu_to_seu(
-        self, east_m: np.ndarray, north_m: np.ndarray, psi_rad: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        east_m_1d = np.array(east_m).squeeze()
-        north_m_1d = np.array(north_m).squeeze()
-        psi_rad_1d = np.array(psi_rad).squeeze()
+    # def enupsi_to_sebdpsi(
+    #     self, east_m: np.ndarray, north_m: np.ndarray, up_m: np.ndarray, psi_rad: np.ndarray
+    # ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        
+    #     east_m_1d  = np.array(east_m).squeeze()
+    #     north_m_1d = np.array(north_m).squeeze()
+    #     up_m_1d    = np.array(up_m).squeeze()
+    #     psi_rad_1d = np.array(psi_rad).squeeze()
 
-        if (east_m_1d.ndim > 1) or (north_m_1d.ndim > 1) or (psi_rad_1d.ndim > 1):
-            raise ValueError("All inputs must be row or column vectors")
+    #     if (east_m_1d.ndim > 1) or (north_m_1d.ndim > 1) or (up_m_1d.ndim > 1) or (psi_rad_1d.ndim > 1):
+    #         raise ValueError("All inputs must be row or column vectors")
 
-        if not (east_m_1d.size == north_m_1d.size == psi_rad_1d.size):
-            raise ValueError("All inputs must be the same size")
+    #     if not (east_m_1d.size == north_m_1d.size == up_m_1d.size == psi_rad_1d.size):
+    #         raise ValueError("All inputs must be the same size")
 
-        query_array = np.hstack((east_m_1d.reshape(-1, 1), north_m_1d.reshape(-1, 1)))
-        _, idx = self._tree.query(query_array)
+    #     query_array = np.hstack((east_m_1d.reshape(-1, 1), north_m_1d.reshape(-1, 1), up_m_1d.reshape(-1, 1)))
+    #     _, idx = self._tree.query(query_array)
 
-        idx = idx.reshape(1, -1)
+    #     idx = idx.reshape(1, -1)
 
-        matched_psi = np.array(self.psi_rad)[idx]
-        matched_E = np.array(self.east_m)[idx]
-        matched_N = np.array(self.north_m)[idx]
-        matched_s = np.array(self.s_m)[idx].squeeze()
+    #     matched_psi = np.array(self.psi_cl_rad)[idx]
+    #     matched_E = np.array(self.east_cl_m)[idx]
+    #     matched_N = np.array(self.north_cl_m)[idx]
+    #     matched_U = np.array(self.up_cl_m)[idx]
+    #     matched_s = np.array(self.s_m)[idx].squeeze()
 
-        path_pos = np.vstack((matched_E, matched_N))
-        veh_pos_from_path = query_array.T - path_pos
+    #     matched_grade = np.array(self.theta_cl_rad)
+    #     matched_bank = np.array(self.phi_cl_rad)
 
-        path_tangent = np.vstack((-np.sin(matched_psi), np.cos(matched_psi)))
-        path_normal = np.array([[0, -1], [1, 0]]) @ path_tangent
+    #     path_pos = np.vstack((matched_E, matched_N, matched_U))
+    #     veh_pos_from_path = query_array.T - path_pos
 
-        dot_s = np.diag(veh_pos_from_path.T @ path_tangent)
-        dot_e = np.diag(veh_pos_from_path.T @ path_normal)
+    #     # TODO: Come back to this and update vectors bank and grade
+    #     path_tangent = np.vstack((-np.sin(matched_psi), np.cos(matched_psi), 0))
+    #     path_normal = np.array([[0, -1, 0],
+    #                             [1, 0, 0],
+    #                             [0, 0, 1]]) @ path_tangent
+    #     path_binormal = np.vstack((0, 0, 1))
 
-        proj_s = dot_s / np.linalg.norm(path_tangent, axis=0, keepdims=True)
-        proj_e = dot_e / np.linalg.norm(path_normal, axis=0, keepdims=True)
+    #     dot_s = np.diag(veh_pos_from_path.T @ path_tangent)
+    #     dot_e = np.diag(veh_pos_from_path.T @ path_normal)
+    #     dot_b = np.diag(veh_pos_from_path.T @ path_binormal)
 
-        result_s = matched_s + proj_s
+    #     proj_s = dot_s / np.linalg.norm(path_tangent, axis=0, keepdims=True)
+    #     proj_e = dot_e / np.linalg.norm(path_normal, axis=0, keepdims=True)
+    #     proj_b = dot_b / np.linalg.norm(path_binormal, axis=0, keepdims=True)
 
-        interp_dpsi = np.interp(result_s, self.s_m, self.psi_rad)
-        result_dpsi = math.wrap_to_pi_float(psi_rad_1d - interp_dpsi)
+    #     result_s = matched_s + proj_s
 
-        out_s_arr = result_s.squeeze()
-        out_e_arr = proj_e.squeeze()
-        out_dpsi_arr = result_dpsi.squeeze()
+    #     interp_dpsi = np.interp(result_s, self.s_m, self.psi_cl_rad)
+    #     result_dpsi = math.wrap_to_pi_float(psi_rad_1d - interp_dpsi)
 
-        try:
-            out_s = out_s_arr.item()
-            out_e = out_e_arr.item()
-            out_dpsi = out_dpsi_arr.item()
-        except ValueError:
-            out_s = out_s_arr
-            out_e = out_e_arr
-            out_dpsi = out_dpsi_arr
+    #     out_s_arr = result_s.squeeze()
+    #     out_e_arr = proj_e.squeeze()
+    #     out_b_arr = proj_b.squeeze()
+    #     out_dpsi_arr = result_dpsi.squeeze()
 
-        return out_s, out_e, out_dpsi
+    #     try:
+    #         out_s = out_s_arr.item()
+    #         out_e = out_e_arr.item()
+    #         out_b = out_b_arr.item()
+    #         out_dpsi = out_dpsi_arr.item()
+    #     except ValueError:
+    #         out_s = out_s_arr
+    #         out_e = out_e_arr
+    #         out_b = out_b_arr
+    #         out_dpsi = out_dpsi_arr
 
-    def enpsi_to_sedpsi(
+    #     return out_s, out_e, out_b, out_dpsi
+
+    def enupsi_to_sebdpsi(
         self,
         east_m: np.ndarray,
         north_m: np.ndarray,
+        up_m: np.ndarray,
         psi_rad: np.ndarray,
         seed_s_m: np.ndarray = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        
         window_size = _S_WINDOW
         if seed_s_m is None:
             seed_s_m = np.zeros(np.array(east_m).shape)
             window_size = self.length_m + 10
 
-        arrays = _format_arrays([east_m, north_m, psi_rad, np.array(seed_s_m)])
+        arrays = _format_arrays([east_m, north_m, up_m, psi_rad, np.array(seed_s_m)])
         _check_array_sizes(arrays)
-        east_m, north_m, psi_rad, seed_s_m = arrays
+        east_m, north_m, up_m, psi_rad, seed_s_m = arrays
 
-        query_array = np.column_stack((east_m, north_m))
+        query_array = np.column_stack((east_m, north_m, up_m))
         _, full_match_idx = self._tree.query(query_array, _NUM_KD_MATCHES)
         match_idx = self._find_closest_in_window(full_match_idx, seed_s_m, window_size)
 
-        rel_east, rel_north = self._get_relative_pos(east_m, north_m, match_idx)
-        psi_guess = self.psi_rad[match_idx]
+        rel_east, rel_north, rel_up = self._get_relative_pos(east_m, north_m, up_m, match_idx)
+        psi_guess = self.psi_cl_rad[match_idx]
 
-        init_proj_s, _ = _project_veh_on_path(rel_east, rel_north, psi_guess)
+        init_proj_s, _, _ = _project_veh_on_path(rel_east, rel_north, rel_up, psi_guess)
         init_s = self.s_m[match_idx] + init_proj_s
 
-        path_psi = np.interp(init_s, self.s_m, self.psi_rad)
-        proj_s, proj_e = _project_veh_on_path(rel_east, rel_north, path_psi)
+        path_psi = np.interp(init_s, self.s_m, self.psi_cl_rad)
+        proj_s, proj_e, proj_b = _project_veh_on_path(rel_east, rel_north, rel_up, path_psi)
 
         result_s = self.s_m[match_idx] + proj_s
         result_dpsi = math.wrap_to_pi_float(psi_rad - path_psi)
 
-        return _cast_array_list_to_floats(result_s, proj_e, result_dpsi)
+        return _cast_array_list_to_floats(result_s, proj_e, proj_b, result_dpsi)
 
-    def seu_to_enu(
-        self, s_m: np.ndarray, e_m: np.ndarray, dpsi_rad: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def sebdpsi_to_enupsi(
+        self, s_m: np.ndarray, e_m: np.ndarray, b_m: np.ndarray, dpsi_rad: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        
         s_m_1d = np.array(s_m).squeeze()
         e_m_1d = np.array(e_m).squeeze()
+        b_m_1d = np.darray(b_m).squeeze()
         dpsi_rad_1d = np.array(dpsi_rad).squeeze()
 
-        if (s_m_1d.ndim > 1) or (e_m_1d.ndim > 1) or (dpsi_rad_1d.ndim > 1):
+        if (s_m_1d.ndim > 1) or (e_m_1d.ndim > 1) or (b_m_1d.ndim > 1) or (dpsi_rad_1d.ndim > 1):
             raise ValueError("All inputs must be row or column vectors")
 
-        if not (s_m_1d.size == e_m_1d.size == dpsi_rad_1d.size):
+        if not (s_m_1d.size == e_m_1d.size == b_m_1d.size == dpsi_rad_1d.size):
             raise ValueError("All inputs must be the same size")
 
         left_neighbors = np.searchsorted(self.s_m, s_m_1d, side="left")
@@ -212,9 +241,10 @@ class SimpleWorld:
 
         diff_s_m = s_m_1d - np.array(self.s_m)[lo_s_idx]
 
-        nom_east_m = np.array(self.east_m)[lo_s_idx]
-        nom_north_m = np.array(self.north_m)[lo_s_idx]
-        nom_psi_rad = np.array(self.psi_rad)[lo_s_idx]
+        nom_east_m = np.array(self.east_cl_m)[lo_s_idx]
+        nom_north_m = np.array(self.north_cl_m)[lo_s_idx]
+        nom_up_m = np.array(self.up_cl_m)[lo_s_idx]
+        nom_psi_rad = np.array(self.psi_cl_rad)[lo_s_idx]
 
         out_east_m = (
             nom_east_m - e_m_1d * np.cos(nom_psi_rad) - diff_s_m * np.sin(nom_psi_rad)
@@ -222,18 +252,23 @@ class SimpleWorld:
         out_north_m = (
             nom_north_m - e_m_1d * np.sin(nom_psi_rad) + diff_s_m * np.cos(nom_psi_rad)
         )
+        out_up_m = (
+            nom_up_m + b_m
+        )
 
-        interp_psi = np.interp(s_m, self.s_m, self.psi_rad).squeeze()
+        interp_psi = np.interp(s_m, self.s_m, self.psi_cl_rad).squeeze()
         out_psi_rad = math.wrap_to_pi_float(interp_psi + dpsi_rad_1d)
 
-        return out_east_m, out_north_m, out_psi_rad
+        return out_east_m, out_north_m, out_up_m, out_psi_rad
 
-    def sedpsi_to_enpsi(
-        self, s_m: np.ndarray, e_m: np.ndarray, dpsi_rad: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        arrays = _format_arrays([s_m, e_m, dpsi_rad])
+
+
+    def sebdpsi_to_enupsi(
+        self, s_m: np.ndarray, e_m: np.ndarray, b_m: np.ndarray, dpsi_rad: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        arrays = _format_arrays([s_m, e_m, b_m, dpsi_rad])
         _check_array_sizes(arrays)
-        s_m, e_m, dpsi_rad = arrays
+        s_m, e_m, b_m, dpsi_rad = arrays
 
         l_idx, r_idx = self._get_nearest_neighbors(s_m)
         l_diff_s = s_m - self.s_m[l_idx]
@@ -242,16 +277,18 @@ class SimpleWorld:
         idx = np.where(np.abs(l_diff_s) <= np.abs(r_diff_s), l_idx, r_idx)
         diff_s = s_m - self.s_m[idx]
 
-        path_east = self.east_m[idx]
-        path_north = self.north_m[idx]
-        path_psi = np.interp(s_m, self.s_m, self.psi_rad)
+        path_east = self.east_cl_m[idx]
+        path_north = self.north_cl_m[idx]
+        path_up = self.up_cl_m[idx]
+        path_psi = np.interp(s_m, self.s_m, self.psi_cl_rad)
 
         out_east = path_east - e_m * np.cos(path_psi) - diff_s * np.sin(path_psi)
         out_north = path_north - e_m * np.sin(path_psi) + diff_s * np.cos(path_psi)
+        out_up = path_up + b_m
 
         out_psi = math.wrap_to_pi_float(path_psi + dpsi_rad)
 
-        return _cast_array_list_to_floats(out_east, out_north, out_psi)
+        return _cast_array_list_to_floats(out_east, out_north, out_up, out_psi)
 
     def double_field(self, key: str) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -266,7 +303,7 @@ class SimpleWorld:
     def plot(self, ax: Axes, line_opts: dict[str, Any] = None):
         if line_opts is None:
             line_opts = {"linestyle": "--", "color": "black"}
-        ax.plot(self.east_m, self.north_m, **line_opts)
+        ax.plot(self.east_cl_m, self.north_cl_m, **line_opts)
 
     def asdict(self) -> dict[str, Any]:
         out_dict = dataclasses.asdict(self)
@@ -315,7 +352,7 @@ class SimpleWorld:
 
     @property
     def _pos_array(self) -> np.ndarray:
-        return np.column_stack((self.east_m, self.north_m))
+        return np.column_stack((self.east_cl_m, self.north_cl_m, self.up_cl_m))
 
     def _get_nearest_neighbors(self, s_m) -> tuple[int, int]:
         l_neighbor = np.searchsorted(self.s_m, s_m, side="left")
@@ -340,15 +377,17 @@ class SimpleWorld:
         return True
 
     def _get_relative_pos(
-        self, east_m: np.ndarray, north_m: np.ndarray, match_idx: int
-    ) -> tuple[np.ndarray, np.ndarray]:
-        path_east = self.east_m[match_idx]
-        path_north = self.north_m[match_idx]
+        self, east_m: np.ndarray, north_m: np.ndarray, up_m: np.ndarray, match_idx: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        path_east = self.east_cl_m[match_idx]
+        path_north = self.north_cl_m[match_idx]
+        path_up = self.up_cl_m[match_idx]
 
         del_east = east_m - path_east
         del_north = north_m - path_north
+        del_up = up_m - path_up
 
-        return del_east, del_north
+        return del_east, del_north, del_up
 
     def _find_closest_in_window(
         self, match_idx: np.ndarray, seed_s_m: np.ndarray, window_size: float
