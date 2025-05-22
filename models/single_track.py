@@ -6,6 +6,7 @@ from casadi_tools.nlp_utils import casadi_builder as cb
 
 from models import vehicle_params as vp
 
+G_MPS2 = 9.81 # Gravitational acceleration (m/s^2)
 
 class TireModel(Protocol):
     """Protocol class defining what tire methods are expected."""
@@ -46,6 +47,10 @@ _Inputs = NV.create_from_field_names(
 
 _InputSlews = NV.create_from_field_names(
     "InputSlews", ("delta_dot_radps", "fx_dot_knps")
+)
+
+_TrackCurvature = NV.create_from_field_names(
+    "TrackCurvature", ("psi_cl_rad", "theta_cl_rad", "phi_cl_rad", "k_psi_cl_radpm", "k_theta_cl_radpm", "k_phi_cl_radpm")
 )
 
 
@@ -101,25 +106,26 @@ class Model:
         return alpha_f_rad, alpha_r_rad
    
 
-    @cb.casadi_method((1,), num_outputs=2)
-    def normal_force_weight_transfer(self, dfz_long_kn):
+    @cb.casadi_method((1, 1,), num_outputs=2)
+    def normal_force_weight_transfer(self, dfz_long_kn, fz_topo_kn):
         """
         Calculate axle normal loads.
         """
 
-        fzf_kn = (self.params.wf_n / 1000.0) - dfz_long_kn
-        fzr_kn = (self.params.wr_n / 1000.0) + dfz_long_kn
+        fzf_kn = (self.params.wf_n / 1000.0) - fz_topo_kn*self.params.b_m/self.params.l_m - dfz_long_kn
+        fzr_kn = (self.params.wr_n / 1000.0) - fz_topo_kn*self.params.a_m/self.params.l_m + dfz_long_kn
 
         return fzf_kn, fzr_kn
 
-    @cb.casadi_method((_StatesDynamics.num_fields, _Inputs.num_fields))
-    def temporal_dynamics_dynamics(self, states_vec, inputs_vec):
+    @cb.casadi_method((_StatesDynamics.num_fields, _Inputs.num_fields, _TrackCurvature.num_fields))
+    def temporal_dynamics_dynamics(self, states_vec, inputs_vec, track_curvature_vec):
         """
         Calculate temporal velocity state derivatives.
         """
         
         states = _StatesDynamics.from_array(states_vec)
         inputs = _Inputs.from_array(inputs_vec)
+        track_curvature = _TrackCurvature.from_array(track_curvature_vec)
 
         alpha_f_rad, alpha_r_rad = self.slip_angles(
             states.ux_mps,
@@ -127,8 +133,17 @@ class Model:
             states.r_radps,
             inputs.delta_rad,
         )
+        
+        
 
-        fzf_kn, fzr_kn = self.normal_force_weight_transfer(states.dfz_long_kn)
+        # Compute effective forces due to topography
+        fx_topo_n = self.params.m_kg*G_MPS2*ca.sin(track_curvature.theta_cl_rad)
+        fy_topo_n = -self.params.m_kg*G_MPS2*ca.cos(track_curvature.theta_cl_rad)*ca.sin(track_curvature.phi_cl_rad)
+        fz_topo_n = (self.params.m_kg*G_MPS2*(1-ca.cos(track_curvature.phi_cl_rad)*ca.cos(track_curvature.theta_cl_rad))
+                     - (self.params.m_kg*(-states.ux_mps**2*((track_curvature.k_theta_cl_radpm*ca.cos(track_curvature.phi_cl_rad) + track_curvature.k_psi_cl_radpm*ca.sin(track_curvature.phi_cl_rad)*ca.cos(track_curvature.theta_cl_rad))))))
+        
+
+        fzf_kn, fzr_kn = self.normal_force_weight_transfer(states.dfz_long_kn, fz_topo_n/1000.0)
         fxf_kn, fxr_kn = self.smooth_fx_distro_kn(inputs.fx_kn)
 
         # Saturating the actual Fx reacted by the tires due to the wheel-lock limit (mu*Fz*cos(alpha))
@@ -184,13 +199,15 @@ class Model:
         )
         fd_n = frr_n + faero_n # Convention: negative Fd is along -x.
 
+
+
         # Evaluate state derivatives
         dux_mps2 = (1 / self.params.m_kg) * (
-            fxf_n*ca.cos(inputs.delta_rad) - fyf_n*ca.sin(inputs.delta_rad) + fxr_n + fd_n
+            fxf_n*ca.cos(inputs.delta_rad) - fyf_n*ca.sin(inputs.delta_rad) + fxr_n + fd_n + fx_topo_n
         ) + states.r_radps*states.uy_mps
 
         duy_mps2 = (1 / self.params.m_kg) * (
-            fyf_n*ca.cos(inputs.delta_rad) + fxf_n*ca.sin(inputs.delta_rad) + fyr_n
+            fyf_n*ca.cos(inputs.delta_rad) + fxf_n*ca.sin(inputs.delta_rad) + fyr_n + fy_topo_n
         ) - states.r_radps*states.ux_mps
 
         dr_radps2 = (1 / self.params.iz_kgm2) * (
@@ -223,8 +240,8 @@ class Model:
 
         return dstates_out.to_array()
 
-    @cb.casadi_method((_StatesGlobal.num_fields, _Inputs.num_fields))
-    def temporal_global_dynamics(self, states_vec, inputs_vec):
+    @cb.casadi_method((_StatesGlobal.num_fields, _Inputs.num_fields, _TrackCurvature.num_fields))
+    def temporal_global_dynamics(self, states_vec, inputs_vec, track_curvature_vec):
         """
         Calculate temporal global dynamic state derivatives.
         """
@@ -240,7 +257,7 @@ class Model:
         )
 
         ddyn_states_vec = self.temporal_dynamics_dynamics(
-            dyn_states.to_array(), inputs_vec
+            dyn_states.to_array(), inputs_vec, track_curvature_vec,
         )
         ddyn_states = _StatesDynamics.from_array(ddyn_states_vec)
 
@@ -261,13 +278,14 @@ class Model:
 
         return dstates_out.to_array()
 
-    @cb.casadi_method((_StatesPath.num_fields, _Inputs.num_fields, 1))
-    def temporal_path_dynamics(self, states_vec, inputs_vec, k_psi_1pm):
+    @cb.casadi_method((_StatesPath.num_fields, _Inputs.num_fields, _TrackCurvature.num_fields))
+    def temporal_path_dynamics(self, states_vec, inputs_vec, track_curvature_vec):
         """
         Calculate temporal path dynamic state derivatives.
         """
 
         states = _StatesPath.from_array(states_vec)
+        track_curvature = _TrackCurvature.from_array(track_curvature_vec)
 
         dyn_states = _StatesDynamics(
             ux_mps=states.ux_mps,
@@ -278,13 +296,13 @@ class Model:
         )
 
         ddyn_states_vec = self.temporal_dynamics_dynamics(
-            dyn_states.to_array(), inputs_vec
+            dyn_states.to_array(), inputs_vec, track_curvature_vec,
         )
         ddyn_states = _StatesDynamics.from_array(ddyn_states_vec)
 
-        ds_mps = (dyn_states.ux_mps*ca.cos(states.dpsi_rad) - dyn_states.uy_mps*ca.sin(states.dpsi_rad))/(1 - states.e_m * k_psi_1pm)
+        ds_mps = (dyn_states.ux_mps*ca.cos(states.dpsi_rad) - dyn_states.uy_mps*ca.sin(states.dpsi_rad))/(1 - states.e_m * track_curvature.k_psi_cl_radpm)
         de_mps = dyn_states.ux_mps*ca.sin(states.dpsi_rad) + dyn_states.uy_mps*ca.cos(states.dpsi_rad)
-        ddpsi_radps = dyn_states.r_radps - k_psi_1pm*ds_mps
+        ddpsi_radps = dyn_states.r_radps - track_curvature.k_psi_cl_radpm*ds_mps
 
         dstates_out = _StatesPath(
             ux_mps=ddyn_states.ux_mps,
